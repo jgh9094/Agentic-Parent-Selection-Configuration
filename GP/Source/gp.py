@@ -16,14 +16,14 @@ import importlib.util
 import logging
 import os
 import random
-import sys
 from functools import partial
 from multiprocessing import Pool
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from deap import algorithms, base, creator, gp, tools
+import ray
+from deap import base, creator, gp, tools
 
 if TYPE_CHECKING:
     from multiprocessing.pool import Pool as PoolType
@@ -46,7 +46,6 @@ logger = logging.getLogger(__name__)
 
 # Module-level random generator for ERC (initialized in run_evolution)
 _module_rng: Optional[np.random.Generator] = None
-
 
 def generate_erc() -> float:
     """
@@ -280,10 +279,8 @@ def validate_inputs(data_dir: str, split_dir: str, selector_path: str,
     # Validate split directory and files
     assert os.path.isdir(split_dir), f"Split directory does not exist: {split_dir}"
     training_path = os.path.join(split_dir, 'training.npy')
-    validation_path = os.path.join(split_dir, 'validation.npy')
     testing_path = os.path.join(split_dir, 'testing.npy')
     assert os.path.isfile(training_path), f"training.npy not found in: {split_dir}"
-    assert os.path.isfile(validation_path), f"validation.npy not found in: {split_dir}"
     assert os.path.isfile(testing_path), f"testing.npy not found in: {split_dir}"
 
     # Validate selector file
@@ -308,21 +305,18 @@ def validate_inputs(data_dir: str, split_dir: str, selector_path: str,
 
 def load_data(data_dir: str, split_dir: str) -> Tuple[np.ndarray, np.ndarray,
                                                        np.ndarray, np.ndarray,
-                                                       np.ndarray, np.ndarray,
                                                        List[str]]:
     """
-    Load data from CSV and partition into training, validation, and testing sets.
+    Load data from CSV and partition into training and testing sets.
 
     Args:
         data_dir: Directory containing data.csv file.
-        split_dir: Directory containing train/val/test split index files.
+        split_dir: Directory containing train/test split index files.
 
     Returns:
         Tuple containing:
             - X_train: Training features
             - y_train: Training targets
-            - X_val: Validation features
-            - y_val: Validation targets
             - X_test: Testing features
             - y_test: Testing targets
             - feature_names: List of feature column names
@@ -344,19 +338,16 @@ def load_data(data_dir: str, split_dir: str) -> Tuple[np.ndarray, np.ndarray,
 
     # Load split indices
     train_indices = np.load(os.path.join(split_dir, 'training.npy'))
-    val_indices = np.load(os.path.join(split_dir, 'validation.npy'))
     test_indices = np.load(os.path.join(split_dir, 'testing.npy'))
 
     logger.info(f"Training samples: {len(train_indices)}")
-    logger.info(f"Validation samples: {len(val_indices)}")
     logger.info(f"Testing samples: {len(test_indices)}")
 
     # Partition data
     X_train, y_train = X[train_indices], y[train_indices]
-    X_val, y_val = X[val_indices], y[val_indices]
     X_test, y_test = X[test_indices], y[test_indices]
 
-    return X_train, y_train, X_val, y_val, X_test, y_test, feature_cols
+    return X_train, y_train, X_test, y_test, feature_cols
 
 def load_selection_function(selector_path: str) -> Callable:
     """
@@ -445,7 +436,7 @@ def evaluate_tree(individual: gp.PrimitiveTree,
                   compile_func: Callable,
                   X_train: np.ndarray,
                   y_train: np.ndarray,
-                  max_size: int = 500) -> Tuple[Tuple[float, ...], Optional[List[float]]]:
+                  max_size: int) -> Tuple[Tuple[float, ...], Optional[List[float]]]:
     """
     Evaluate a GP tree on the training data.
 
@@ -485,7 +476,7 @@ def evaluate_tree(individual: gp.PrimitiveTree,
         if ss_tot == 0:
             r2 = 0.0
         else:
-            r2 = 1 - (ss_res / ss_tot)
+            r2 = 1.0 - (ss_res / ss_tot)
 
         # Calculate absolute errors for each sample (for parent selection)
         absolute_errors = list(np.abs(y_train - predictions))
@@ -495,41 +486,6 @@ def evaluate_tree(individual: gp.PrimitiveTree,
     except Exception as e:
         logger.debug(f"Evaluation failed: {e}")
         return ((-np.inf,), None)
-
-
-def parallel_evaluate(individuals: List[gp.PrimitiveTree],
-                      toolbox: base.Toolbox,
-                      X_train: np.ndarray,
-                      y_train: np.ndarray,
-                      max_size: int,
-                      pool: Optional["PoolType"] = None) -> List[Tuple[Tuple[float, ...], Optional[List[float]]]]:
-    """
-    Evaluate multiple individuals in parallel.
-
-    Args:
-        individuals: List of GP trees to evaluate.
-        toolbox: DEAP toolbox with compile function.
-        X_train: Training features.
-        y_train: Training targets.
-        max_size: Maximum allowed tree size.
-        pool: Multiprocessing pool for parallel evaluation.
-
-    Returns:
-        List of (fitness, errors) tuples for each individual.
-    """
-    eval_func = partial(evaluate_tree,
-                        compile_func=toolbox.compile,
-                        X_train=X_train,
-                        y_train=y_train,
-                        max_size=max_size)
-
-    if pool is not None:
-        results = pool.map(eval_func, individuals)
-    else:
-        results = list(map(eval_func, individuals))
-
-    return results
-
 
 def calculate_r2(individual: gp.PrimitiveTree,
                  compile_func: Callable,
@@ -565,40 +521,29 @@ def calculate_r2(individual: gp.PrimitiveTree,
     except Exception:
         return -np.inf
 
-
-# =============================================================================
-# PARENT SELECTION WRAPPER
-# =============================================================================
-
-def custom_selection(population: List,
-                     fitnesses_per_sample: List[List[float]],
-                     selection_func: Callable,
-                     k: int) -> List:
-    """
-    Perform parent selection using the custom selection function.
-
-    Args:
-        population: Current population of individuals.
-        fitnesses_per_sample: List of error lists for each individual.
-        selection_func: The custom selection function.
-        k: Number of parents to select.
-
-    Returns:
-        List of selected parent individuals.
-    """
-    selected_parents = []
-
-    for _ in range(k):
-        # Call the selection function to get the index of the selected parent
-        selected_idx = selection_func(fitnesses_per_sample)
-        selected_parents.append(toolbox.clone(population[selected_idx]))
-
-    return selected_parents
-
-
 # =============================================================================
 # OFFSPRING GENERATION
 # =============================================================================
+
+# Ray remote function for parallel parent selection
+@ray.remote
+def ray_select_parent(selection_func: Callable,
+                      fitnesses_per_sample: List[List[float]],
+                      idx: int) -> Tuple[int, int]:
+    """
+    Ray remote function to perform parent selection.
+
+    Args:
+        selection_func: The custom selection function.
+        fitnesses_per_sample: List of error lists for each individual.
+        idx: Index position where the result should be stored.
+
+    Returns:
+        Tuple of (storage_index, selected_parent_index).
+    """
+    selected_parent_idx = selection_func(fitnesses_per_sample)
+    return (idx, selected_parent_idx)
+
 
 def generate_offspring(population: List,
                        fitnesses_per_sample: List[List[float]],
@@ -614,7 +559,7 @@ def generate_offspring(population: List,
 
     The process:
     1. Determine how many offspring via crossover vs mutation only
-    2. Select the appropriate number of parents
+    2. Select the appropriate number of parents (using Ray for parallelization)
     3. Apply crossover and/or mutation operations
 
     Args:
@@ -633,10 +578,11 @@ def generate_offspring(population: List,
     """
     offspring = []
 
+
     # Determine offspring generation method for each individual
     # crossover_rate determines proportion of offspring via crossover
     # mutation_rate determines proportion via mutation only
-    n_crossover = int(pop_size * cxpb)
+    n_crossover = list(rng.choice(['m', 'c'], pop_size, p=[mutpb, cxpb])).count('c')
     n_mutation_only = pop_size - n_crossover
 
     # Select parents for crossover (need 2 parents per offspring)
@@ -646,16 +592,37 @@ def generate_offspring(population: List,
 
     total_parents_needed = n_crossover_parents + n_mutation_parents
 
-    # Select all required parents
-    selected_parents = []
-    for _ in range(total_parents_needed):
-        selected_idx = selection_func(fitnesses_per_sample)
-        selected_parents.append(toolbox.clone(population[selected_idx]))
+    # Initialize selected_parents with -1 placeholder values
+    selected_parents = [-1] * total_parents_needed
+
+    # Put fitnesses_per_sample in Ray's object store once to avoid repeated serialization
+    fitnesses_ref = ray.put(fitnesses_per_sample)
+
+    # Submit Ray tasks for parallel parent selection
+    pending_refs = []
+    for i in range(total_parents_needed):
+        ref = ray_select_parent.remote(selection_func, fitnesses_ref, i)
+        pending_refs.append(ref)
+
+    # Process Ray tasks as they complete using ray.wait
+    while pending_refs:
+        done_refs, pending_refs = ray.wait(pending_refs, num_returns=1)
+        for done_ref in done_refs:
+            storage_idx, parent_idx = ray.get(done_ref)
+            selected_parents[storage_idx] = toolbox.clone(population[parent_idx])
+
+    # Assert that all parents have been selected (no -1 values remain)
+    assert all(p != -1 for p in selected_parents), \
+        "Error: Not all parents were selected. Some positions still contain -1."
 
     parent_idx = 0
 
+    # Available mutation operators
+    mutation_operators = [toolbox.mutUniform, toolbox.mutNodeReplacement,
+                          toolbox.mutShrink, toolbox.mutInsert]
+
     # Generate offspring via crossover
-    for i in range(n_crossover):
+    for _ in range(n_crossover):
         parent1 = selected_parents[parent_idx]
         parent2 = selected_parents[parent_idx + 1]
         parent_idx += 2
@@ -672,7 +639,9 @@ def generate_offspring(population: List,
 
         # Potentially apply mutation to crossover offspring
         if rng.random() < mutpb:
-            child, = toolbox.mutate(child)
+            # Randomly select a mutation operator
+            mutate_op = mutation_operators[int(rng.integers(0, len(mutation_operators)))]
+            child, = mutate_op(child)
             del child.fitness.values
 
         # Apply height limit
@@ -687,8 +656,9 @@ def generate_offspring(population: List,
         parent = selected_parents[parent_idx]
         parent_idx += 1
 
-        # Apply mutation
-        child, = toolbox.mutate(parent)
+        # Randomly select a mutation operator
+        mutate_op = mutation_operators[int(rng.integers(0, len(mutation_operators)))]
+        child, = mutate_op(parent)
         del child.fitness.values
 
         # Apply height limit
@@ -708,83 +678,62 @@ def generate_offspring(population: List,
 def post_hoc_analysis(population: List,
                       population_r2: List[float],
                       toolbox: base.Toolbox,
-                      X_train: np.ndarray, y_train: np.ndarray,
-                      X_val: np.ndarray, y_val: np.ndarray,
                       X_test: np.ndarray, y_test: np.ndarray,
-                      rng: np.random.Generator) -> Tuple[Optional[gp.PrimitiveTree], float, float, float]:
+                      rng: np.random.Generator) -> Tuple[Optional[gp.PrimitiveTree], float, float]:
     """
     Perform post-hoc analysis to select the final solution.
 
     Process:
-    1. Find trees within 5% of max training R^2
-    2. Evaluate those on validation set
-    3. Find trees within 5% of max validation R^2
-    4. Randomly select one if multiple remain
-    5. Evaluate on test set
+    1. Find trees tied for the best training R^2
+    2. Randomly select one if multiple are tied
+    3. Evaluate on test set
 
     Args:
         population: Final population of individuals.
         population_r2: Training R^2 for each individual.
         toolbox: DEAP toolbox with compile function.
         X_train, y_train: Training data.
-        X_val, y_val: Validation data.
         X_test, y_test: Test data.
         rng: Random number generator.
 
     Returns:
-        Tuple of (best_tree, test_r2, val_r2, train_r2).
+        Tuple of (best_tree, test_r2, train_r2).
     """
-    # Step 1: Filter by training R^2
+    # Step 1: Find solutions tied for best training R^2
     valid_indices = [i for i, r2 in enumerate(population_r2) if r2 > -np.inf]
 
     if not valid_indices:
         logger.error("No valid solutions found in final population!")
-        return None, -np.inf, -np.inf, -np.inf
+        return None, -np.inf, -np.inf
 
     valid_r2 = [population_r2[i] for i in valid_indices]
     max_train_r2 = max(valid_r2)
-    threshold_train = max_train_r2 - 0.05 * abs(max_train_r2)
 
-    candidates_train = [valid_indices[i] for i, r2 in enumerate(valid_r2)
-                        if r2 >= threshold_train]
+    # Find all solutions tied for the best training R^2
+    tied_candidates = [valid_indices[i] for i, r2 in enumerate(valid_r2)
+                       if r2 == max_train_r2]
 
     logger.info(f"Training R^2 max: {max_train_r2:.6f}")
-    logger.info(f"Candidates within 5% of max training R^2: {len(candidates_train)}")
+    logger.info(f"Solutions tied for best training R^2: {len(tied_candidates)}")
 
-    # Step 2: Evaluate candidates on validation set
-    val_r2_scores = []
-    for idx in candidates_train:
-        ind = population[idx]
-        val_r2 = calculate_r2(ind, toolbox.compile, X_val, y_val)
-        val_r2_scores.append((idx, val_r2))
-
-    # Step 3: Filter by validation R^2
-    max_val_r2 = max(r2 for _, r2 in val_r2_scores if r2 > -np.inf)
-    threshold_val = max_val_r2 - 0.05 * abs(max_val_r2)
-
-    candidates_val = [(idx, r2) for idx, r2 in val_r2_scores if r2 >= threshold_val]
-
-    logger.info(f"Validation R^2 max: {max_val_r2:.6f}")
-    logger.info(f"Candidates within 5% of max validation R^2: {len(candidates_val)}")
-
-    # Step 4: Select final candidate (randomly if multiple)
-    if len(candidates_val) > 1:
-        choice_idx = int(rng.integers(0, len(candidates_val)))
-        final_idx, final_val_r2 = candidates_val[choice_idx]
-        logger.info("Multiple candidates remain; randomly selected one.")
+    # Step 2: Select final candidate (randomly if multiple tied)
+    if len(tied_candidates) > 1:
+        choice_idx = int(rng.integers(0, len(tied_candidates)))
+        final_idx = tied_candidates[choice_idx]
+        logger.info("Multiple tied solutions; randomly selected one.")
     else:
-        final_idx, final_val_r2 = candidates_val[0]
+        final_idx = tied_candidates[0]
 
     final_tree = population[final_idx]
     final_train_r2 = population_r2[final_idx]
 
-    # Step 5: Evaluate on test set
+    # Step 3: Evaluate on test set
     final_test_r2 = calculate_r2(final_tree, toolbox.compile, X_test, y_test)
 
     logger.info(f"Final solution - Train R^2: {final_train_r2:.6f}, "
-                f"Val R^2: {final_val_r2:.6f}, Test R^2: {final_test_r2:.6f}")
+                f"Test R^2: {final_test_r2:.6f}")
 
-    return final_tree, final_test_r2, final_val_r2, final_train_r2
+    return final_tree, final_test_r2, final_train_r2
 
 
 # =============================================================================
@@ -794,22 +743,19 @@ def post_hoc_analysis(population: List,
 def save_outputs(output_dir: str,
                  tree: gp.PrimitiveTree,
                  test_r2: float,
-                 val_r2: float,
                  train_r2: float) -> None:
     """
     Save the final outputs to the specified directory.
 
-    Saves four files:
+    Saves three files:
     1. final_tree.txt - Human-readable tree expression
     2. test_r2.txt - Test R^2 score
-    3. validation_r2.txt - Validation R^2 score
-    4. training_r2.txt - Training R^2 score
+    3. training_r2.txt - Training R^2 score
 
     Args:
         output_dir: Directory to save outputs.
         tree: The final GP tree solution.
         test_r2: Test R^2 performance.
-        val_r2: Validation R^2 performance.
         train_r2: Training R^2 performance.
     """
     # Save tree expression
@@ -823,12 +769,6 @@ def save_outputs(output_dir: str,
     with open(test_path, 'w') as f:
         f.write(f"{test_r2}\n")
     logger.info(f"Saved test R^2 to: {test_path}")
-
-    # Save validation R^2
-    val_path = os.path.join(output_dir, 'validation_r2.txt')
-    with open(val_path, 'w') as f:
-        f.write(f"{val_r2}\n")
-    logger.info(f"Saved validation R^2 to: {val_path}")
 
     # Save training R^2
     train_path = os.path.join(output_dir, 'training_r2.txt')
@@ -851,7 +791,7 @@ def run_evolution(data_dir: str,
                   n_generations: int = 100,
                   cxpb: float = 0.8,
                   mutpb: float = 0.2,
-                  max_height: int = 40,
+                  max_height: int = 50,
                   max_size: int = 500) -> None:
     """
     Run the complete evolutionary GP process.
@@ -867,7 +807,7 @@ def run_evolution(data_dir: str,
         n_generations: Number of generations (default 100).
         cxpb: Crossover probability (default 0.8).
         mutpb: Mutation probability (default 0.2).
-        max_height: Maximum tree height (default 40).
+        max_height: Maximum tree height (default 50).
         max_size: Maximum tree size (default 500).
     """
     global toolbox  # Need global for multiprocessing
@@ -880,6 +820,11 @@ def run_evolution(data_dir: str,
     # Also seed standard random for DEAP internal operations
     random.seed(seed)
 
+    # Initialize Ray for parallel parent selection
+    if not ray.is_initialized():
+        ray.init(num_cpus=n_cpus, ignore_reinit_error=True)
+        logger.info(f"Initialized Ray with {n_cpus} CPUs")
+
     logger.info(f"Starting GP evolution with seed: {seed}")
     logger.info(f"Population size: {pop_size}, Generations: {n_generations}")
     logger.info(f"Crossover rate: {cxpb}, Mutation rate: {mutpb}")
@@ -887,7 +832,7 @@ def run_evolution(data_dir: str,
     logger.info(f"Using {n_cpus} CPU(s) for parallelization")
 
     # Load data
-    X_train, y_train, X_val, y_val, X_test, y_test, feature_names = load_data(data_dir, split_dir)
+    X_train, y_train, X_test, y_test, feature_names = load_data(data_dir, split_dir)
     num_features = len(feature_names)
 
     # Load selection function
@@ -916,23 +861,22 @@ def run_evolution(data_dir: str,
     # Crossover: One-point crossover for GP trees (standard for symbolic regression)
     toolbox.register("mate", gp.cxOnePoint)
 
-    # Mutation: Randomly select one mutation type
+    # Mutation: Register all mutation types (one will be randomly selected per mutation)
     # Options: uniform mutation (replaces subtree), node replacement, shrink, insert
-    mutation_types = [
-        partial(gp.mutUniform, expr=toolbox.expr, pset=pset),
-        partial(gp.mutNodeReplacement, pset=pset),
-        partial(gp.mutShrink),
-        partial(gp.mutInsert, pset=pset)
-    ]
-    mutation_idx = int(rng.integers(0, len(mutation_types)))
-    selected_mutation = mutation_types[mutation_idx]
-    toolbox.register("mutate", selected_mutation)
+    toolbox.register("mutUniform", gp.mutUniform, expr=toolbox.expr, pset=pset)
+    toolbox.register("mutNodeReplacement", gp.mutNodeReplacement, pset=pset)
+    toolbox.register("mutShrink", gp.mutShrink)
+    toolbox.register("mutInsert", gp.mutInsert, pset=pset)
 
-    logger.info(f"Selected mutation operator: {selected_mutation.func.__name__}")
+    mutation_operators = ["mutUniform", "mutNodeReplacement", "mutShrink", "mutInsert"]
+    logger.info(f"Available mutation operators: {mutation_operators}")
 
     # Decorate with height limit
     toolbox.decorate("mate", gp.staticLimit(key=lambda ind: ind.height, max_value=max_height))
-    toolbox.decorate("mutate", gp.staticLimit(key=lambda ind: ind.height, max_value=max_height))
+    toolbox.decorate("mutUniform", gp.staticLimit(key=lambda ind: ind.height, max_value=max_height))
+    toolbox.decorate("mutNodeReplacement", gp.staticLimit(key=lambda ind: ind.height, max_value=max_height))
+    toolbox.decorate("mutShrink", gp.staticLimit(key=lambda ind: ind.height, max_value=max_height))
+    toolbox.decorate("mutInsert", gp.staticLimit(key=lambda ind: ind.height, max_value=max_height))
 
     # Initialize population
     population = toolbox.population(n=pop_size)
@@ -987,8 +931,11 @@ def run_evolution(data_dir: str,
                 logger.error("All solutions failed evaluation! Stopping evolution.")
                 break
 
-            # Log statistics
-            fitnesses = [ind.fitness.values[0] for ind in population]
+
+
+            # Log statistics for only solutions with positive R^2
+            fitnesses = [ind.fitness.values[0] for ind in population if ind.fitness.values[0] > 0.0]
+            logger.info(f"Number of solutions with positive R^2: {len(fitnesses)}")
             logger.info(f"Population size: {len(population)}")
             logger.info(f"Best R^2: {max(fitnesses):.6f}")
             logger.info(f"Mean R^2: {np.mean(fitnesses):.6f}")
@@ -1034,19 +981,18 @@ def run_evolution(data_dir: str,
 
         # Post-hoc Analysis
         if len(final_population) > 0:
-            best_tree, test_r2, val_r2, train_r2 = post_hoc_analysis(
+            best_tree, test_r2, train_r2 = post_hoc_analysis(
                 population=final_population,
                 population_r2=final_r2_scores,
                 toolbox=toolbox,
                 X_train=X_train, y_train=y_train,
-                X_val=X_val, y_val=y_val,
                 X_test=X_test, y_test=y_test,
                 rng=rng
             )
 
             if best_tree is not None:
                 # Save outputs
-                save_outputs(output_dir, best_tree, test_r2, val_r2, train_r2)
+                save_outputs(output_dir, best_tree, test_r2, train_r2)
             else:
                 logger.error("No valid solution found for output!")
         else:
@@ -1056,6 +1002,10 @@ def run_evolution(data_dir: str,
         if pool is not None:
             pool.close()
             pool.join()
+        # Shutdown Ray
+        if ray.is_initialized():
+            ray.shutdown()
+            logger.info("Ray shutdown complete")
 
 
 # =============================================================================
@@ -1085,7 +1035,7 @@ def parse_arguments() -> argparse.Namespace:
         '--split_dir',
         type=str,
         required=True,
-        help='Directory containing training.npy, validation.npy, and testing.npy files'
+        help='Directory containing training.npy and testing.npy files'
     )
 
     parser.add_argument(
@@ -1120,7 +1070,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--pop_size',
         type=int,
-        default=500,
+        default=1000,
         help='Population size'
     )
 
@@ -1161,7 +1111,6 @@ def parse_arguments() -> argparse.Namespace:
 
     return parser.parse_args()
 
-
 def main() -> None:
     """
     Main entry point for the GP symbolic regression system.
@@ -1193,7 +1142,6 @@ def main() -> None:
         max_height=args.max_height,
         max_size=args.max_size
     )
-
 
 if __name__ == "__main__":
     main()
