@@ -66,7 +66,7 @@ def generate_fitnesses(rng: np.random.Generator):
     Optimized: Uses numpy for vectorized random generation, then converts to list of lists.
     """
     # number of individual solutions list performance lists (predefined upper bound)
-    N = 100
+    N = 1000
     # number of performance values per individual list (upper bound)
     M = 100
 
