@@ -16,7 +16,7 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate agp-ps
 
 # Define the selector and output directory (they are the same here)
-ALL_DIR=~/Repos/Agentic-Parent-Selection-Configuration/Algorithm_Output/Exp1/gpt-4o/Rep_${SLURM_ARRAY_TASK_ID}
+ALL_DIR=~/Repos/Agentic-Parent-Selection-Configuration/Algorithm_Output/Exp2/No_RAG/gpt-4o/Rep_${SLURM_ARRAY_TASK_ID}
 SELECTOR_DIR=${ALL_DIR}/selector.py
 
 # Seed param

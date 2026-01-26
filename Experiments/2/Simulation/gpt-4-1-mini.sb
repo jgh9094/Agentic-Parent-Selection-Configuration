@@ -4,9 +4,9 @@
 #SBATCH --ntasks=1
 #SBATCH --array=1-100
 #SBATCH --cpus-per-task=1
-#SBATCH -t 48:00:00
+#SBATCH -t 01:00:00
 #SBATCH --mem=1GB
-#SBATCH --job-name=4o
+#SBATCH --job-name=4.1-mini
 #SBATCH -p defq,moore
 #SBATCH --exclude=esplhpc-cp040
 ###############################################################
@@ -16,7 +16,7 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate agp-ps
 
 # Define the selector and output directory (they are the same here)
-ALL_DIR=~/Repos/Agentic-Parent-Selection-Configuration/Algorithm_Output/Exp1/gpt-4o/Rep_${SLURM_ARRAY_TASK_ID}
+ALL_DIR=~/Repos/Agentic-Parent-Selection-Configuration/Algorithm_Output/Exp2/No_RAG/gpt-4-1-mini/Rep_${SLURM_ARRAY_TASK_ID}
 SELECTOR_DIR=${ALL_DIR}/selector.py
 
 # Seed param

@@ -7,7 +7,7 @@
 #SBATCH -t 01:00:00
 #SBATCH --mem=1GB
 #SBATCH --job-name=4.1-mini
-#SBATCH -p defq
+#SBATCH -p defq,moore
 #SBATCH --exclude=esplhpc-cp040
 ###############################################################
 
