@@ -1,4 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 Algorithm_Output/
-Experiment_Data/Prelim_*
+Regression_Results/
+Data-GP/Exp1
+Data-GP/Exp2
