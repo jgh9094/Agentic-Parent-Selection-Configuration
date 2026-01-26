@@ -13,16 +13,16 @@
 
 # load conda environment
 source ~/anaconda3/etc/profile.d/conda.sh
-conda activate agentic-gp
+conda activate agp-ps
 
 # Define the selector and output directory (they are the same here)
-ALL_DIR=~/Repos/agentic-gp/Algorithm_Output/Exp1/llama-3-1-70b/Rep_${SLURM_ARRAY_TASK_ID}
+ALL_DIR=~/Repos/Agentic-Parent-Selection-Configuration/Algorithm_Output/Exp1/llama-3-1-70b/Rep_${SLURM_ARRAY_TASK_ID}
 SELECTOR_DIR=${ALL_DIR}/selector.py
 
 # Seed param
 SEED=$((SLURM_ARRAY_TASK_ID))
 
 # let it rip
-python ~/Repos/agentic-gp/gp_simulated_selection/simulated_selection.py \
+python ~/Repos/Agentic-Parent-Selection-Configuration/gp_simulated_selection/simulated_selection.py \
 ${SELECTOR_DIR} \
 --seed ${SEED}
