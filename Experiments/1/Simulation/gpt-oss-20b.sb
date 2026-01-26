@@ -23,6 +23,6 @@ SELECTOR_DIR=${ALL_DIR}/selector.py
 SEED=$((SLURM_ARRAY_TASK_ID))
 
 # let it rip
-python ~/Repos/Agentic-Parent-Selection-Configuration/gp_simulated_selection/simulated_selection.py \
+python ~/Repos/Agentic-Parent-Selection-Configuration/GP/Source/simulated_selection.py \
 ${SELECTOR_DIR} \
 --seed ${SEED}
