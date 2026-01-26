@@ -25,5 +25,4 @@ SEED=$((SLURM_ARRAY_TASK_ID))
 # let it rip
 python ~/Repos/agentic-gp/gp_simulated_selection/simulated_selection.py \
 ${SELECTOR_DIR} \
---seed ${SEED} \
---output_csv ${OUTPUT_DIR} \
+--seed ${SEED}
