@@ -148,7 +148,7 @@ def main():
     print_interval = max(1000, args.calls // 100)
 
     # N is constant (100 individuals), no need to extract it from generate_fitnesses every iteration
-    N = 100
+    N = 1000
 
     # Execute up to args.calls times; stop on first unmet criterion
     for i in range(1, args.calls + 1):
