@@ -8,6 +8,13 @@ parent selection strategies, parallel evaluation, and comprehensive logging.
 
 Compatible with Python 3.13 and DEAP 1.4.3.
 
+Parallelization Optimizations (Ray):
+- Batched tree evaluation: Processes multiple trees per Ray task to reduce overhead
+- Batched parent selection: Selects multiple parents per Ray task
+- Efficient result collection: Uses ray.wait() with adaptive num_returns for responsive processing
+- Object store optimization: Reuses data references to minimize serialization
+- Dynamic batch sizing: Automatically adjusts batch size based on CPU count and workload
+
 Author: Agentic Parent Selection Configuration Project
 """
 
@@ -16,17 +23,12 @@ import importlib.util
 import logging
 import os
 import random
-from functools import partial
-from multiprocessing import Pool
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import ray
 from deap import base, creator, gp, tools
-
-if TYPE_CHECKING:
-    from multiprocessing.pool import Pool as PoolType
 
 # =============================================================================
 # LOGGING CONFIGURATION
@@ -38,6 +40,38 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# RAY CONFIGURATION
+# =============================================================================
+
+# Batch size for Ray task submission (tune based on population size and CPU count)
+EVALUATION_BATCH_SIZE = 50
+SELECTION_BATCH_SIZE = 100
+
+def calculate_optimal_batch_size(total_items: int, n_cpus: int, min_batch_size: int, max_batch_size: int) -> int:
+    """
+    Calculate optimal batch size for Ray parallelization.
+
+    Args:
+        total_items: Total number of items to process.
+        n_cpus: Number of available CPUs.
+        min_batch_size: Minimum batch size (avoid too much overhead).
+        max_batch_size: Maximum batch size (avoid unbalanced work distribution).
+
+    Returns:
+        Optimal batch size.
+    """
+    if total_items <= n_cpus:
+        # If items <= CPUs, use batch size of 1 to maximize parallelism
+        return 1
+
+    # Aim for roughly 2-4 batches per CPU for load balancing
+    ideal_batch_size = max(1, total_items // (n_cpus * 3))
+
+    # Clamp to min/max bounds
+    return max(min_batch_size, min(ideal_batch_size, max_batch_size))
 
 
 # =============================================================================
@@ -432,6 +466,41 @@ def create_primitive_set(num_features: int, feature_names: List[str]) -> gp.Prim
 # TREE EVALUATION
 # =============================================================================
 
+@ray.remote
+def ray_evaluate_trees_batch(individuals: List[gp.PrimitiveTree],
+                             pset: gp.PrimitiveSet,
+                             X_train: np.ndarray,
+                             y_train: np.ndarray,
+                             max_size: int,
+                             start_idx: int) -> List[Tuple[int, Tuple[Tuple[float, ...], Optional[List[float]]]]]:
+    """
+    Ray remote function to evaluate a batch of GP trees on the training data.
+
+    Batching reduces Ray overhead by evaluating multiple trees per task.
+
+    Args:
+        individuals: List of GP trees to evaluate.
+        pset: Primitive set for compiling trees (serializes better than compile_func).
+        X_train: Training features.
+        y_train: Training targets.
+        max_size: Maximum allowed tree size for bloat control.
+        start_idx: Starting index for this batch.
+
+    Returns:
+        List of (index, evaluation_result) tuples.
+    """
+    # Compile function locally in the worker
+    compile_func = lambda ind: gp.compile(ind, pset)
+
+    results = []
+    for i, individual in enumerate(individuals):
+        idx = start_idx + i
+        result = evaluate_tree(individual, compile_func, X_train, y_train, max_size)
+        results.append((idx, result))
+
+    return results
+
+
 def evaluate_tree(individual: gp.PrimitiveTree,
                   compile_func: Callable,
                   X_train: np.ndarray,
@@ -525,24 +594,31 @@ def calculate_r2(individual: gp.PrimitiveTree,
 # OFFSPRING GENERATION
 # =============================================================================
 
-# Ray remote function for parallel parent selection
 @ray.remote
-def ray_select_parent(selection_func: Callable,
-                      fitnesses_per_sample: List[List[float]],
-                      idx: int) -> Tuple[int, int]:
+def ray_select_parents_batch(selection_func: Callable,
+                             fitnesses_per_sample: List[List[float]],
+                             n_parents: int) -> List[int]:
     """
-    Ray remote function to perform parent selection.
+    Ray remote function to perform batch parent selection.
+
+    Batching reduces Ray overhead by selecting multiple parents per task.
 
     Args:
         selection_func: The custom selection function.
         fitnesses_per_sample: List of error lists for each individual.
-        idx: Index position where the result should be stored.
+        n_parents: Number of parents to select in this batch.
+        seed: Random seed for this batch (for reproducibility).
 
     Returns:
-        Tuple of (storage_index, selected_parent_index).
+        List of selected parent indices.
     """
-    selected_parent_idx = selection_func(fitnesses_per_sample)
-    return (idx, selected_parent_idx)
+
+    selected_parents = []
+    for _ in range(n_parents):
+        parent_idx = selection_func(fitnesses_per_sample)
+        selected_parents.append(parent_idx)
+
+    return selected_parents
 
 
 def generate_offspring(population: List,
@@ -553,13 +629,14 @@ def generate_offspring(population: List,
                        cxpb: float,
                        mutpb: float,
                        max_height: int,
-                       rng: np.random.Generator) -> List:
+                       rng: np.random.Generator,
+                       n_cpus: int) -> List:
     """
     Generate offspring for the next generation.
 
     The process:
     1. Determine how many offspring via crossover vs mutation only
-    2. Select the appropriate number of parents (using Ray for parallelization)
+    2. Select the appropriate number of parents (using batched Ray for parallelization)
     3. Apply crossover and/or mutation operations
 
     Args:
@@ -578,10 +655,7 @@ def generate_offspring(population: List,
     """
     offspring = []
 
-
     # Determine offspring generation method for each individual
-    # crossover_rate determines proportion of offspring via crossover
-    # mutation_rate determines proportion via mutation only
     n_crossover = list(rng.choice(['m', 'c'], pop_size, p=[mutpb, cxpb])).count('c')
     n_mutation_only = pop_size - n_crossover
 
@@ -589,31 +663,52 @@ def generate_offspring(population: List,
     n_crossover_parents = 2 * n_crossover
     # Select parents for mutation only (need 1 parent per offspring)
     n_mutation_parents = n_mutation_only
-
+    # Total parents needed
     total_parents_needed = n_crossover_parents + n_mutation_parents
 
-    # Initialize selected_parents with -1 placeholder values
-    selected_parents = [-1] * total_parents_needed
+    if total_parents_needed == 0:
+        return offspring
 
     # Put fitnesses_per_sample in Ray's object store once to avoid repeated serialization
     fitnesses_ref = ray.put(fitnesses_per_sample)
 
-    # Submit Ray tasks for parallel parent selection
+    # Calculate optimal batch size for parent selection
+    batch_size = calculate_optimal_batch_size(
+        total_items=total_parents_needed,
+        n_cpus=n_cpus,
+        min_batch_size=10,
+        max_batch_size=SELECTION_BATCH_SIZE
+    )
+    n_batches = (total_parents_needed + batch_size - 1) // batch_size
+
+    logger.debug(f"Parent selection: {total_parents_needed} parents, {n_batches} batches of ~{batch_size}")
+
     pending_refs = []
-    for i in range(total_parents_needed):
-        ref = ray_select_parent.remote(selection_func, fitnesses_ref, i)
+    for batch_idx in range(n_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, total_parents_needed)
+        n_parents_in_batch = batch_end - batch_start
+
+
+        ref = ray_select_parents_batch.remote(
+            selection_func,
+            fitnesses_ref,
+            n_parents_in_batch,
+        )
         pending_refs.append(ref)
 
-    # Process Ray tasks as they complete using ray.wait
-    while pending_refs:
-        done_refs, pending_refs = ray.wait(pending_refs, num_returns=1)
-        for done_ref in done_refs:
-            storage_idx, parent_idx = ray.get(done_ref)
-            selected_parents[storage_idx] = toolbox.clone(population[parent_idx])
+    # Collect all results at once (more efficient than incremental ray.wait)
+    batch_results = ray.get(pending_refs)
 
-    # Assert that all parents have been selected (no -1 values remain)
-    assert all(p != -1 for p in selected_parents), \
-        "Error: Not all parents were selected. Some positions still contain -1."
+    # Flatten batch results and clone selected individuals
+    selected_parent_indices = []
+    for batch in batch_results:
+        selected_parent_indices.extend(batch)
+
+    selected_parents = [toolbox.clone(population[idx]) for idx in selected_parent_indices]
+
+    assert len(selected_parents) == total_parents_needed, \
+        f"Error: Expected {total_parents_needed} parents, got {len(selected_parents)}"
 
     parent_idx = 0
 
@@ -627,44 +722,65 @@ def generate_offspring(population: List,
         parent2 = selected_parents[parent_idx + 1]
         parent_idx += 2
 
-        # Apply crossover using DEAP's one-point crossover for GP trees
-        child1, child2 = toolbox.mate(parent1, parent2)
+        # Try up to 50 times to generate a valid offspring
+        child = None
+        for _ in range(50):
+            # Clone parents for this attempt
+            p1_copy = toolbox.clone(parent1)
+            p2_copy = toolbox.clone(parent2)
 
-        # Delete fitness values as individuals have been modified
-        del child1.fitness.values
-        del child2.fitness.values
+            # Apply crossover using DEAP's one-point crossover for GP trees
+            child1, child2 = toolbox.mate(p1_copy, p2_copy)
 
-        # Use child1 as the offspring (randomly could also use child2)
-        child = child1
+            # Delete fitness values as individuals have been modified
+            del child1.fitness.values
+            del child2.fitness.values
 
-        # Potentially apply mutation to crossover offspring
-        if rng.random() < mutpb:
-            # Randomly select a mutation operator
-            mutate_op = mutation_operators[int(rng.integers(0, len(mutation_operators)))]
-            child, = mutate_op(child)
-            del child.fitness.values
+            # Use child1 as the offspring (randomly could also use child2)
+            child_candidate = child1
 
-        # Apply height limit
-        if child.height > max_height:
-            # If child is too tall, use the original parent
-            child = toolbox.clone(population[int(rng.integers(0, len(population)))])
+            # Potentially apply mutation to crossover offspring
+            if rng.random() < mutpb:
+                # Randomly select a mutation operator
+                mutate_op = mutation_operators[int(rng.integers(0, len(mutation_operators)))]
+                child_candidate, = mutate_op(child_candidate)
+                del child_candidate.fitness.values
+
+            # Check height limit
+            if child_candidate.height <= max_height:
+                child = child_candidate
+                break
+
+        # If all attempts failed, randomly return one of the selected parents
+        if child is None:
+            child = toolbox.clone(parent1 if rng.random() < 0.5 else parent2)
 
         offspring.append(child)
 
     # Generate offspring via mutation only
-    for i in range(n_mutation_only):
+    for _ in range(n_mutation_only):
         parent = selected_parents[parent_idx]
         parent_idx += 1
 
-        # Randomly select a mutation operator
-        mutate_op = mutation_operators[int(rng.integers(0, len(mutation_operators)))]
-        child, = mutate_op(parent)
-        del child.fitness.values
+        # Try up to 50 times to generate a valid offspring
+        child = None
+        for _ in range(50):
+            # Clone parent for this attempt
+            parent_copy = toolbox.clone(parent)
 
-        # Apply height limit
-        if child.height > max_height:
-            # If child is too tall, use the original parent
-            child = toolbox.clone(population[int(rng.integers(0, len(population)))])
+            # Randomly select a mutation operator
+            mutate_op = mutation_operators[int(rng.integers(0, len(mutation_operators)))]
+            child_candidate, = mutate_op(parent_copy)
+            del child_candidate.fitness.values
+
+            # Check height limit
+            if child_candidate.height <= max_height:
+                child = child_candidate
+                break
+
+        # If all attempts failed, return the selected parent
+        if child is None:
+            child = toolbox.clone(parent)
 
         offspring.append(child)
 
@@ -678,7 +794,8 @@ def generate_offspring(population: List,
 def post_hoc_analysis(population: List,
                       population_r2: List[float],
                       toolbox: base.Toolbox,
-                      X_test: np.ndarray, y_test: np.ndarray,
+                      X_test: np.ndarray,
+                      y_test: np.ndarray,
                       rng: np.random.Generator) -> Tuple[Optional[gp.PrimitiveTree], float, float]:
     """
     Perform post-hoc analysis to select the final solution.
@@ -692,7 +809,6 @@ def post_hoc_analysis(population: List,
         population: Final population of individuals.
         population_r2: Training R^2 for each individual.
         toolbox: DEAP toolbox with compile function.
-        X_train, y_train: Training data.
         X_test, y_test: Test data.
         rng: Random number generator.
 
@@ -810,7 +926,6 @@ def run_evolution(data_dir: str,
         max_height: Maximum tree height (default 50).
         max_size: Maximum tree size (default 500).
     """
-    global toolbox  # Need global for multiprocessing
     global _module_rng  # Module-level rng for ERC generation
 
     # Set random seeds using numpy's modern random generator
@@ -820,10 +935,22 @@ def run_evolution(data_dir: str,
     # Also seed standard random for DEAP internal operations
     random.seed(seed)
 
-    # Initialize Ray for parallel parent selection
+    # Initialize Ray for parallelization
     if not ray.is_initialized():
-        ray.init(num_cpus=n_cpus, ignore_reinit_error=True)
-        logger.info(f"Initialized Ray with {n_cpus} CPUs")
+        try:
+            ray.init(
+                num_cpus=n_cpus,
+                ignore_reinit_error=True,
+                logging_level=logging.ERROR,  # Reduce Ray logging verbosity
+                _system_config={
+                    "max_io_workers": min(n_cpus, 4),  # Limit I/O workers
+                }
+            )
+            logger.info(f"Initialized Ray with {n_cpus} CPUs")
+            logger.info(f"Ray cluster resources: {ray.cluster_resources()}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Ray: {e}")
+            raise
 
     logger.info(f"Starting GP evolution with seed: {seed}")
     logger.info(f"Population size: {pop_size}, Generations: {n_generations}")
@@ -885,25 +1012,61 @@ def run_evolution(data_dir: str,
     # Archive to store all successfully evaluated solutions and their training R^2
     archive = []  # List of (individual, r2) tuples
 
-    # Set up multiprocessing pool
-    pool = Pool(processes=n_cpus) if n_cpus > 1 else None
+    # Put training data and primitive set in Ray's object store once
+    X_train_ref = ray.put(X_train)
+    y_train_ref = ray.put(y_train)
+    pset_ref = ray.put(pset)
 
     try:
         # Main evolutionary loop
         for gen in range(n_generations):
             logger.info(f"=== Generation {gen + 1}/{n_generations} ===")
 
-            # Step 1: Tree Evaluation
-            eval_func = partial(evaluate_tree,
-                                compile_func=toolbox.compile,
-                                X_train=X_train,
-                                y_train=y_train,
-                                max_size=max_size)
+            # Step 1: Tree Evaluation using batched Ray tasks
+            batch_size = calculate_optimal_batch_size(
+                total_items=len(population),
+                n_cpus=n_cpus,
+                min_batch_size=10,
+                max_batch_size=EVALUATION_BATCH_SIZE
+            )
+            n_batches = (len(population) + batch_size - 1) // batch_size
 
-            if pool is not None:
-                results = pool.map(eval_func, population)
-            else:
-                results = list(map(eval_func, population))
+            logger.debug(f"Evaluating {len(population)} individuals in {n_batches} batches of ~{batch_size}")
+
+            pending_refs = []
+            for batch_idx in range(n_batches):
+                batch_start = batch_idx * batch_size
+                batch_end = min(batch_start + batch_size, len(population))
+                batch_individuals = population[batch_start:batch_end]
+
+                ref = ray_evaluate_trees_batch.remote(
+                    batch_individuals,
+                    pset_ref,
+                    X_train_ref,
+                    y_train_ref,
+                    max_size,
+                    batch_start
+                )
+                pending_refs.append(ref)
+
+            # Use ray.wait to collect results as they complete
+            # Process in batches for efficiency while maintaining responsiveness
+            results = [None] * len(population)
+            completed_batches = 0
+            while pending_refs:
+                # Wait for up to 25% of remaining tasks or at least 1
+                num_to_wait = max(1, len(pending_refs) // 4)
+                done_refs, pending_refs = ray.wait(pending_refs, num_returns=num_to_wait, timeout=None)
+
+                for done_ref in done_refs:
+                    batch_result = ray.get(done_ref)
+                    for idx, result in batch_result:
+                        results[idx] = result
+                    completed_batches += 1
+
+                # Optional: Log progress for long evaluations
+                if completed_batches % max(1, n_batches // 4) == 0 and completed_batches < n_batches:
+                    logger.debug(f"Evaluation progress: {completed_batches}/{n_batches} batches completed")
 
             # Process evaluation results
             valid_population = []
@@ -931,15 +1094,13 @@ def run_evolution(data_dir: str,
                 logger.error("All solutions failed evaluation! Stopping evolution.")
                 break
 
-
-
             # Log statistics for only solutions with positive R^2
             fitnesses = [ind.fitness.values[0] for ind in population if ind.fitness.values[0] > 0.0]
-            logger.info(f"Number of solutions with positive R^2: {len(fitnesses)}")
-            logger.info(f"Population size: {len(population)}")
-            logger.info(f"Best R^2: {max(fitnesses):.6f}")
-            logger.info(f"Mean R^2: {np.mean(fitnesses):.6f}")
-            logger.info(f"Std R^2: {np.std(fitnesses):.6f}")
+            if len(fitnesses) > 0:
+                logger.info(f"Population size: {len(population)}, Positive R^2 solutions: {len(fitnesses)}")
+                logger.info(f"R^2 - Best: {max(fitnesses):.6f}, Mean: {np.mean(fitnesses):.6f}, Std: {np.std(fitnesses):.6f}")
+            else:
+                logger.warning(f"Population size: {len(population)}, but no solutions with positive R^2!")
 
             # Skip offspring generation on the last generation
             if gen == n_generations - 1:
@@ -955,7 +1116,8 @@ def run_evolution(data_dir: str,
                 cxpb=cxpb,
                 mutpb=mutpb,
                 max_height=max_height,
-                rng=rng
+                rng=rng,
+                n_cpus=n_cpus
             )
 
             # No replacement strategy: offspring becomes the new population
@@ -964,18 +1126,17 @@ def run_evolution(data_dir: str,
         logger.info("Evolution complete!")
 
         # Extract all unique solutions and their R^2 scores from archive
-        # Use the final population for post-hoc analysis
-        final_population = []
-        final_r2_scores = []
-
-        # Get unique solutions from archive (using string representation as key)
-        seen = set()
+        # Use dict to deduplicate solutions (keeps last occurrence with its R^2)
+        unique_solutions = {}
         for ind, r2 in archive:
-            ind_str = str(ind)
-            if ind_str not in seen and r2 > -np.inf:
-                seen.add(ind_str)
-                final_population.append(ind)
-                final_r2_scores.append(r2)
+            if r2 > -np.inf:
+                ind_str = str(ind)
+                # Keep the best R^2 for each unique tree structure
+                if ind_str not in unique_solutions or r2 > unique_solutions[ind_str][1]:
+                    unique_solutions[ind_str] = (ind, r2)
+
+        final_population = [ind for ind, _ in unique_solutions.values()]
+        final_r2_scores = [r2 for _, r2 in unique_solutions.values()]
 
         logger.info(f"Total unique solutions in archive: {len(final_population)}")
 
@@ -985,8 +1146,8 @@ def run_evolution(data_dir: str,
                 population=final_population,
                 population_r2=final_r2_scores,
                 toolbox=toolbox,
-                X_train=X_train, y_train=y_train,
-                X_test=X_test, y_test=y_test,
+                X_test=X_test,
+                y_test=y_test,
                 rng=rng
             )
 
@@ -999,9 +1160,6 @@ def run_evolution(data_dir: str,
             logger.error("No solutions available for post-hoc analysis!")
 
     finally:
-        if pool is not None:
-            pool.close()
-            pool.join()
         # Shutdown Ray
         if ray.is_initialized():
             ray.shutdown()
@@ -1066,49 +1224,6 @@ def parse_arguments() -> argparse.Namespace:
         help='Number of CPUs for parallelization'
     )
 
-    # Optional evolutionary parameters (with defaults)
-    parser.add_argument(
-        '--pop_size',
-        type=int,
-        default=1000,
-        help='Population size'
-    )
-
-    parser.add_argument(
-        '--n_generations',
-        type=int,
-        default=100,
-        help='Number of generations'
-    )
-
-    parser.add_argument(
-        '--cxpb',
-        type=float,
-        default=0.8,
-        help='Crossover probability'
-    )
-
-    parser.add_argument(
-        '--mutpb',
-        type=float,
-        default=0.2,
-        help='Mutation probability'
-    )
-
-    parser.add_argument(
-        '--max_height',
-        type=int,
-        default=40,
-        help='Maximum tree height for bloat control'
-    )
-
-    parser.add_argument(
-        '--max_size',
-        type=int,
-        default=500,
-        help='Maximum tree size for bloat control'
-    )
-
     return parser.parse_args()
 
 def main() -> None:
@@ -1134,13 +1249,7 @@ def main() -> None:
         selector_path=args.selector_path,
         seed=args.seed,
         output_dir=args.output_dir,
-        n_cpus=args.n_cpus,
-        pop_size=args.pop_size,
-        n_generations=args.n_generations,
-        cxpb=args.cxpb,
-        mutpb=args.mutpb,
-        max_height=args.max_height,
-        max_size=args.max_size
+        n_cpus=args.n_cpus
     )
 
 if __name__ == "__main__":
