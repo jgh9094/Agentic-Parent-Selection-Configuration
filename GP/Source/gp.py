@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 import ray
 from deap import base, creator, gp, tools
+import time
 
 # =============================================================================
 # LOGGING CONFIGURATION
@@ -313,8 +314,10 @@ def validate_inputs(data_dir: str, split_dir: str, selector_path: str,
     # Validate split directory and files
     assert os.path.isdir(split_dir), f"Split directory does not exist: {split_dir}"
     training_path = os.path.join(split_dir, 'training.npy')
+    validation_path = os.path.join(split_dir, 'validation.npy')
     testing_path = os.path.join(split_dir, 'testing.npy')
     assert os.path.isfile(training_path), f"training.npy not found in: {split_dir}"
+    assert os.path.isfile(validation_path), f"validation.npy not found in: {split_dir}"
     assert os.path.isfile(testing_path), f"testing.npy not found in: {split_dir}"
 
     # Validate selector file
@@ -339,18 +342,21 @@ def validate_inputs(data_dir: str, split_dir: str, selector_path: str,
 
 def load_data(data_dir: str, split_dir: str) -> Tuple[np.ndarray, np.ndarray,
                                                        np.ndarray, np.ndarray,
+                                                       np.ndarray, np.ndarray,
                                                        List[str]]:
     """
-    Load data from CSV and partition into training and testing sets.
+    Load data from CSV and partition into training, validation, and testing sets.
 
     Args:
         data_dir: Directory containing data.csv file.
-        split_dir: Directory containing train/test split index files.
+        split_dir: Directory containing train/val/test split index files.
 
     Returns:
         Tuple containing:
             - X_train: Training features
             - y_train: Training targets
+            - X_val: Validation features
+            - y_val: Validation targets
             - X_test: Testing features
             - y_test: Testing targets
             - feature_names: List of feature column names
@@ -372,16 +378,19 @@ def load_data(data_dir: str, split_dir: str) -> Tuple[np.ndarray, np.ndarray,
 
     # Load split indices
     train_indices = np.load(os.path.join(split_dir, 'training.npy'))
+    val_indices = np.load(os.path.join(split_dir, 'validation.npy'))
     test_indices = np.load(os.path.join(split_dir, 'testing.npy'))
 
     logger.info(f"Training samples: {len(train_indices)}")
+    logger.info(f"Validation samples: {len(val_indices)}")
     logger.info(f"Testing samples: {len(test_indices)}")
 
     # Partition data
     X_train, y_train = X[train_indices], y[train_indices]
+    X_val, y_val = X[val_indices], y[val_indices]
     X_test, y_test = X[test_indices], y[test_indices]
 
-    return X_train, y_train, X_test, y_test, feature_cols
+    return X_train, y_train, X_val, y_val, X_test, y_test, feature_cols
 
 def load_selection_function(selector_path: str) -> Callable:
     """
@@ -518,14 +527,15 @@ def evaluate_tree(individual: gp.PrimitiveTree,
 
     Returns:
         Tuple containing:
-            - (R^2 score,): Tuple with R^2 performance (for DEAP fitness)
+            - (MSE,): Tuple with mean squared error (for DEAP fitness)
             - List of absolute errors for each training sample
 
-    Returns ((-np.inf,), None) if evaluation fails.
+    Returns ((np.inf,), None) if evaluation fails.
     """
     # Bloat control: reject trees that are too large
     if len(individual) > max_size:
-        return ((-np.inf,), None)
+        logger.debug(f"Tree rejected: size {len(individual)} > max_size {max_size}")
+        return ((np.inf,), None)
 
     try:
         # Compile the tree
@@ -536,32 +546,27 @@ def evaluate_tree(individual: gp.PrimitiveTree,
 
         # Check for invalid predictions
         if np.any(np.isnan(predictions)) or np.any(np.isinf(predictions)):
-            return ((-np.inf,), None)
+            logger.debug(f"Tree rejected: invalid predictions (NaN or Inf)")
+            return ((np.inf,), None)
 
-        # Calculate R^2 (coefficient of determination)
-        ss_res = np.sum((y_train - predictions) ** 2)
-        ss_tot = np.sum((y_train - np.mean(y_train)) ** 2)
-
-        if ss_tot == 0:
-            r2 = 0.0
-        else:
-            r2 = 1.0 - (ss_res / ss_tot)
+        # Calculate MSE (mean squared error)
+        mse = np.mean((y_train - predictions) ** 2)
 
         # Calculate absolute errors for each sample (for parent selection)
         absolute_errors = list(np.abs(y_train - predictions))
 
-        return ((r2,), absolute_errors)
+        return ((mse,), absolute_errors)
 
     except Exception as e:
         logger.debug(f"Evaluation failed: {e}")
-        return ((-np.inf,), None)
+        return ((np.inf,), None)
 
-def calculate_r2(individual: gp.PrimitiveTree,
-                 compile_func: Callable,
-                 X: np.ndarray,
-                 y: np.ndarray) -> float:
+def calculate_mse(individual: gp.PrimitiveTree,
+                  compile_func: Callable,
+                  X: np.ndarray,
+                  y: np.ndarray) -> float:
     """
-    Calculate R^2 score for a tree on given data.
+    Calculate MSE for a tree on given data.
 
     Args:
         individual: The GP tree to evaluate.
@@ -570,25 +575,53 @@ def calculate_r2(individual: gp.PrimitiveTree,
         y: Target values.
 
     Returns:
-        R^2 score, or -np.inf if evaluation fails.
+        MSE, or np.inf if evaluation fails.
     """
     try:
         func = compile_func(individual)
         predictions = np.array([func(*x) for x in X])
 
         if np.any(np.isnan(predictions)) or np.any(np.isinf(predictions)):
-            return -np.inf
+            return np.inf
 
-        ss_res = np.sum((y - predictions) ** 2)
-        ss_tot = np.sum((y - np.mean(y)) ** 2)
+        mse = np.mean((y - predictions) ** 2)
 
-        if ss_tot == 0:
-            return 0.0
-
-        return 1 - (ss_res / ss_tot)
+        return mse
 
     except Exception:
-        return -np.inf
+        return np.inf
+
+@ray.remote
+def ray_calculate_mse_batch(individuals: List[gp.PrimitiveTree],
+                            pset: gp.PrimitiveSet,
+                            X: np.ndarray,
+                            y: np.ndarray,
+                            start_idx: int) -> List[Tuple[int, float]]:
+    """
+    Ray remote function to calculate MSE for a batch of GP trees on given data.
+
+    Batching reduces Ray overhead by evaluating multiple trees per task.
+
+    Args:
+        individuals: List of GP trees to evaluate.
+        pset: Primitive set for compiling trees.
+        X: Feature data.
+        y: Target values.
+        start_idx: Starting index for this batch.
+
+    Returns:
+        List of (index, mse) tuples.
+    """
+    # Compile function locally in the worker
+    compile_func = lambda ind: gp.compile(ind, pset)
+
+    results = []
+    for i, individual in enumerate(individuals):
+        idx = start_idx + i
+        mse = calculate_mse(individual, compile_func, X, y)
+        results.append((idx, mse))
+
+    return results
 
 # =============================================================================
 # OFFSPRING GENERATION
@@ -792,45 +825,101 @@ def generate_offspring(population: List,
 # =============================================================================
 
 def post_hoc_analysis(population: List,
-                      population_r2: List[float],
+                      population_mse: List[float],
                       toolbox: base.Toolbox,
+                      X_val: np.ndarray,
+                      y_val: np.ndarray,
                       X_test: np.ndarray,
                       y_test: np.ndarray,
-                      rng: np.random.Generator) -> Tuple[Optional[gp.PrimitiveTree], float, float]:
+                      pset: gp.PrimitiveSet,
+                      n_cpus: int,
+                      rng: np.random.Generator) -> Tuple[Optional[gp.PrimitiveTree], float, float, float]:
     """
     Perform post-hoc analysis to select the final solution.
 
     Process:
-    1. Find trees tied for the best training R^2
-    2. Randomly select one if multiple are tied
-    3. Evaluate on test set
+    1. Evaluate all valid models on validation set (parallelized with Ray)
+    2. Find solutions with minimum MSE on validation set
+    3. Randomly select one if multiple are tied
+    4. Evaluate selected tree on test set
 
     Args:
         population: Final population of individuals.
-        population_r2: Training R^2 for each individual.
+        population_mse: Training MSE for each individual.
         toolbox: DEAP toolbox with compile function.
+        X_val, y_val: Validation data.
         X_test, y_test: Test data.
+        pset: Primitive set for compiling trees.
+        n_cpus: Number of CPUs for parallelization.
         rng: Random number generator.
 
     Returns:
-        Tuple of (best_tree, test_r2, train_r2).
+        Tuple of (best_tree, test_mse, validation_mse, train_mse).
     """
-    # Step 1: Find solutions tied for best training R^2
-    valid_indices = [i for i, r2 in enumerate(population_r2) if r2 > -np.inf]
+    # Step 1: Find valid solutions and evaluate them on validation set
+    valid_indices = [i for i, mse in enumerate(population_mse) if mse < np.inf]
 
     if not valid_indices:
         logger.error("No valid solutions found in final population!")
-        return None, -np.inf, -np.inf
+        return None, np.inf, np.inf, np.inf
 
-    valid_r2 = [population_r2[i] for i in valid_indices]
-    max_train_r2 = max(valid_r2)
+    # Evaluate all valid solutions on validation set using Ray parallelization
+    valid_population = [population[idx] for idx in valid_indices]
+    n_valid = len(valid_population)
 
-    # Find all solutions tied for the best training R^2
-    tied_candidates = [valid_indices[i] for i, r2 in enumerate(valid_r2)
-                       if r2 == max_train_r2]
+    logger.info(f"Evaluating {n_valid} valid solutions on validation set using Ray...")
 
-    logger.info(f"Training R^2 max: {max_train_r2:.6f}")
-    logger.info(f"Solutions tied for best training R^2: {len(tied_candidates)}")
+    # Put validation data in Ray's object store
+    X_val_ref = ray.put(X_val)
+    y_val_ref = ray.put(y_val)
+    pset_ref = ray.put(pset)
+
+    # Calculate optimal batch size
+    batch_size = calculate_optimal_batch_size(
+        total_items=n_valid,
+        n_cpus=n_cpus,
+        min_batch_size=10,
+        max_batch_size=EVALUATION_BATCH_SIZE
+    )
+    n_batches = (n_valid + batch_size - 1) // batch_size
+
+    logger.debug(f"Validation evaluation: {n_valid} individuals, {n_batches} batches of ~{batch_size}")
+
+    # Submit batched Ray tasks
+    pending_refs = []
+    for batch_idx in range(n_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, n_valid)
+        batch_individuals = valid_population[batch_start:batch_end]
+
+        ref = ray_calculate_mse_batch.remote(
+            batch_individuals,
+            pset_ref,
+            X_val_ref,
+            y_val_ref,
+            batch_start
+        )
+        pending_refs.append(ref)
+
+    # Collect all results
+    validation_mses = [None] * n_valid
+    batch_results = ray.get(pending_refs)
+
+    for batch in batch_results:
+        for idx, mse in batch:
+            validation_mses[idx] = mse
+
+    logger.info(f"Validation evaluation complete.")
+
+    # Find minimum validation MSE
+    min_val_mse = min(validation_mses)
+
+    # Find all solutions tied for the best validation MSE
+    tied_candidates = [valid_indices[i] for i, mse in enumerate(validation_mses)
+                       if mse == min_val_mse]
+
+    logger.info(f"Validation MSE min: {min_val_mse:.6f}")
+    logger.info(f"Solutions tied for best validation MSE: {len(tied_candidates)}")
 
     # Step 2: Select final candidate (randomly if multiple tied)
     if len(tied_candidates) > 1:
@@ -838,18 +927,20 @@ def post_hoc_analysis(population: List,
         final_idx = tied_candidates[choice_idx]
         logger.info("Multiple tied solutions; randomly selected one.")
     else:
+        choice_idx = 0
         final_idx = tied_candidates[0]
 
     final_tree = population[final_idx]
-    final_train_r2 = population_r2[final_idx]
+    final_train_mse = population_mse[final_idx]
+    final_val_mse = min_val_mse  # All tied candidates have the same validation MSE
 
     # Step 3: Evaluate on test set
-    final_test_r2 = calculate_r2(final_tree, toolbox.compile, X_test, y_test)
+    final_test_mse = calculate_mse(final_tree, toolbox.compile, X_test, y_test)
 
-    logger.info(f"Final solution - Train R^2: {final_train_r2:.6f}, "
-                f"Test R^2: {final_test_r2:.6f}")
+    logger.info(f"Final solution - Train MSE: {final_train_mse:.6f}, "
+                f"Val MSE: {final_val_mse:.6f}, Test MSE: {final_test_mse:.6f}")
 
-    return final_tree, final_test_r2, final_train_r2
+    return final_tree, final_test_mse, final_val_mse, final_train_mse
 
 
 # =============================================================================
@@ -858,21 +949,24 @@ def post_hoc_analysis(population: List,
 
 def save_outputs(output_dir: str,
                  tree: gp.PrimitiveTree,
-                 test_r2: float,
-                 train_r2: float) -> None:
+                 test_mse: float,
+                 val_mse: float,
+                 train_mse: float) -> None:
     """
     Save the final outputs to the specified directory.
 
-    Saves three files:
+    Saves four files:
     1. final_tree.txt - Human-readable tree expression
-    2. test_r2.txt - Test R^2 score
-    3. training_r2.txt - Training R^2 score
+    2. test_mse.txt - Test MSE score
+    3. validation_mse.txt - Validation MSE score
+    4. training_mse.txt - Training MSE score
 
     Args:
         output_dir: Directory to save outputs.
         tree: The final GP tree solution.
-        test_r2: Test R^2 performance.
-        train_r2: Training R^2 performance.
+        test_mse: Test MSE performance.
+        val_mse: Validation MSE performance.
+        train_mse: Training MSE performance.
     """
     # Save tree expression
     tree_path = os.path.join(output_dir, 'final_tree.txt')
@@ -880,17 +974,23 @@ def save_outputs(output_dir: str,
         f.write(str(tree))
     logger.info(f"Saved tree expression to: {tree_path}")
 
-    # Save test R^2
-    test_path = os.path.join(output_dir, 'test_r2.txt')
+    # Save test MSE
+    test_path = os.path.join(output_dir, 'test_mse.txt')
     with open(test_path, 'w') as f:
-        f.write(f"{test_r2}\n")
-    logger.info(f"Saved test R^2 to: {test_path}")
+        f.write(f"{test_mse}\n")
+    logger.info(f"Saved test MSE to: {test_path}")
 
-    # Save training R^2
-    train_path = os.path.join(output_dir, 'training_r2.txt')
+    # Save validation MSE
+    val_path = os.path.join(output_dir, 'validation_mse.txt')
+    with open(val_path, 'w') as f:
+        f.write(f"{val_mse}\n")
+    logger.info(f"Saved validation MSE to: {val_path}")
+
+    # Save training MSE
+    train_path = os.path.join(output_dir, 'training_mse.txt')
     with open(train_path, 'w') as f:
-        f.write(f"{train_r2}\n")
-    logger.info(f"Saved training R^2 to: {train_path}")
+        f.write(f"{train_mse}\n")
+    logger.info(f"Saved training MSE to: {train_path}")
 
 
 # =============================================================================
@@ -903,12 +1003,12 @@ def run_evolution(data_dir: str,
                   seed: int,
                   output_dir: str,
                   n_cpus: int,
-                  pop_size: int = 1000,
-                  n_generations: int = 100,
+                  pop_size: int = 500,
+                  n_generations: int = 50,
                   cxpb: float = 0.8,
                   mutpb: float = 0.2,
-                  max_height: int = 50,
-                  max_size: int = 500) -> None:
+                  max_height: int = 20,
+                  max_size: int = 100) -> None:
     """
     Run the complete evolutionary GP process.
 
@@ -919,12 +1019,12 @@ def run_evolution(data_dir: str,
         seed: Random seed for reproducibility.
         output_dir: Directory to save outputs.
         n_cpus: Number of CPUs for parallelization.
-        pop_size: Population size (default 1000).
-        n_generations: Number of generations (default 100).
+        pop_size: Population size (default 500).
+        n_generations: Number of generations (default 50).
         cxpb: Crossover probability (default 0.8).
         mutpb: Mutation probability (default 0.2).
-        max_height: Maximum tree height (default 50).
-        max_size: Maximum tree size (default 500).
+        max_height: Maximum tree height (default 20).
+        max_size: Maximum tree size (default 200).
     """
     global _module_rng  # Module-level rng for ERC generation
 
@@ -959,7 +1059,7 @@ def run_evolution(data_dir: str,
     logger.info(f"Using {n_cpus} CPU(s) for parallelization")
 
     # Load data
-    X_train, y_train, X_test, y_test, feature_names = load_data(data_dir, split_dir)
+    X_train, y_train, X_val, y_val, X_test, y_test, feature_names = load_data(data_dir, split_dir)
     num_features = len(feature_names)
 
     # Load selection function
@@ -969,11 +1069,11 @@ def run_evolution(data_dir: str,
     pset = create_primitive_set(num_features, feature_names)
 
     # Define fitness and individual types
-    # Using FitnessMax since we want to maximize R^2
-    if not hasattr(creator, "FitnessMax"):
-        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    # Using FitnessMin since we want to minimize MSE
+    if not hasattr(creator, "FitnessMin"):
+        creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
     if not hasattr(creator, "Individual"):
-        creator.create("Individual", gp.PrimitiveTree, fitness=creator.FitnessMax)
+        creator.create("Individual", gp.PrimitiveTree, fitness=creator.FitnessMin)
 
     # Create toolbox
     toolbox = base.Toolbox()
@@ -1009,8 +1109,8 @@ def run_evolution(data_dir: str,
     population = toolbox.population(n=pop_size)
     logger.info(f"Initialized population with {len(population)} individuals")
 
-    # Archive to store all successfully evaluated solutions and their training R^2
-    archive = []  # List of (individual, r2) tuples
+    # Archive to store all successfully evaluated solutions and their training MSE
+    archive = []  # List of (individual, mse) tuples
 
     # Put training data and primitive set in Ray's object store once
     X_train_ref = ray.put(X_train)
@@ -1071,17 +1171,19 @@ def run_evolution(data_dir: str,
             # Process evaluation results
             valid_population = []
             valid_errors = []
-            population_r2 = []
+            population_mse = []
 
             for ind, (fitness, errors) in zip(population, results):
                 if errors is not None:  # Valid evaluation
                     ind.fitness.values = fitness
                     valid_population.append(ind)
                     valid_errors.append(errors)
-                    population_r2.append(fitness[0])
+                    population_mse.append(fitness[0])
 
                     # Add to archive
                     archive.append((toolbox.clone(ind), fitness[0]))
+                else:
+                    logger.debug(f"Individual failed: fitness={fitness}, errors={errors}")
 
             # Remove failed solutions from population
             n_removed = len(population) - len(valid_population)
@@ -1094,13 +1196,13 @@ def run_evolution(data_dir: str,
                 logger.error("All solutions failed evaluation! Stopping evolution.")
                 break
 
-            # Log statistics for only solutions with positive R^2
-            fitnesses = [ind.fitness.values[0] for ind in population if ind.fitness.values[0] > 0.0]
+            # Log statistics for valid solutions
+            fitnesses = [ind.fitness.values[0] for ind in population if ind.fitness.values[0] < np.inf]
             if len(fitnesses) > 0:
-                logger.info(f"Population size: {len(population)}, Positive R^2 solutions: {len(fitnesses)}")
-                logger.info(f"R^2 - Best: {max(fitnesses):.6f}, Mean: {np.mean(fitnesses):.6f}, Std: {np.std(fitnesses):.6f}")
+                logger.info(f"Population size: {len(population)}, Valid solutions: {len(fitnesses)}")
+                logger.info(f"MSE - Best: {min(fitnesses):.6f}, Mean: {np.mean(fitnesses):.6f}, Std: {np.std(fitnesses):.6f}")
             else:
-                logger.warning(f"Population size: {len(population)}, but no solutions with positive R^2!")
+                logger.warning(f"Population size: {len(population)}, but no valid solutions!")
 
             # Skip offspring generation on the last generation
             if gen == n_generations - 1:
@@ -1125,35 +1227,39 @@ def run_evolution(data_dir: str,
 
         logger.info("Evolution complete!")
 
-        # Extract all unique solutions and their R^2 scores from archive
-        # Use dict to deduplicate solutions (keeps last occurrence with its R^2)
+        # Extract all unique solutions and their MSE scores from archive
+        # Use dict to deduplicate solutions (keeps best MSE for each unique tree structure)
         unique_solutions = {}
-        for ind, r2 in archive:
-            if r2 > -np.inf:
+        for ind, mse in archive:
+            if mse < np.inf:
                 ind_str = str(ind)
-                # Keep the best R^2 for each unique tree structure
-                if ind_str not in unique_solutions or r2 > unique_solutions[ind_str][1]:
-                    unique_solutions[ind_str] = (ind, r2)
+                # Keep the best MSE (lowest) for each unique tree structure
+                if ind_str not in unique_solutions or mse < unique_solutions[ind_str][1]:
+                    unique_solutions[ind_str] = (ind, mse)
 
         final_population = [ind for ind, _ in unique_solutions.values()]
-        final_r2_scores = [r2 for _, r2 in unique_solutions.values()]
+        final_mse_scores = [mse for _, mse in unique_solutions.values()]
 
         logger.info(f"Total unique solutions in archive: {len(final_population)}")
 
         # Post-hoc Analysis
         if len(final_population) > 0:
-            best_tree, test_r2, train_r2 = post_hoc_analysis(
+            best_tree, test_mse, val_mse, train_mse = post_hoc_analysis(
                 population=final_population,
-                population_r2=final_r2_scores,
+                population_mse=final_mse_scores,
                 toolbox=toolbox,
+                X_val=X_val,
+                y_val=y_val,
                 X_test=X_test,
                 y_test=y_test,
+                pset=pset,
+                n_cpus=n_cpus,
                 rng=rng
             )
 
             if best_tree is not None:
                 # Save outputs
-                save_outputs(output_dir, best_tree, test_r2, train_r2)
+                save_outputs(output_dir, best_tree, test_mse, val_mse, train_mse)
             else:
                 logger.error("No valid solution found for output!")
         else:
@@ -1243,6 +1349,7 @@ def main() -> None:
     )
 
     # Run evolution
+    start_time = time.time()
     run_evolution(
         data_dir=args.data_dir,
         split_dir=args.split_dir,
@@ -1251,6 +1358,7 @@ def main() -> None:
         output_dir=args.output_dir,
         n_cpus=args.n_cpus
     )
+    print(f"Total execution time: {(time.time() - start_time) / 60:.2f} minutes")
 
 if __name__ == "__main__":
     main()
