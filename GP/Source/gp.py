@@ -528,7 +528,7 @@ def evaluate_tree(individual: gp.PrimitiveTree,
     Returns:
         Tuple containing:
             - (MSE,): Tuple with mean squared error (for DEAP fitness)
-            - List of absolute errors for each training sample
+            - List of squared errors for each training sample
 
     Returns ((np.inf,), None) if evaluation fails.
     """
@@ -549,13 +549,16 @@ def evaluate_tree(individual: gp.PrimitiveTree,
             logger.debug(f"Tree rejected: invalid predictions (NaN or Inf)")
             return ((np.inf,), None)
 
-        # Calculate MSE (mean squared error)
-        mse = np.mean((y_train - predictions) ** 2)
+        # Calculate squared errors for each sample
+        squared_errors = (y_train - predictions) ** 2
 
-        # Calculate absolute errors for each sample (for parent selection)
-        absolute_errors = list(np.abs(y_train - predictions))
+        # Calculate MSE (mean squared error) from squared errors
+        mse = np.mean(squared_errors)
 
-        return ((mse,), absolute_errors)
+        # Convert squared errors to list for parent selection
+        squared_errors_list = list(squared_errors)
+
+        return ((mse,), squared_errors_list)
 
     except Exception as e:
         logger.debug(f"Evaluation failed: {e}")
@@ -1007,7 +1010,7 @@ def run_evolution(data_dir: str,
                   n_generations: int = 50,
                   cxpb: float = 0.8,
                   mutpb: float = 0.2,
-                  max_height: int = 20,
+                  max_height: int = 17,
                   max_size: int = 100) -> None:
     """
     Run the complete evolutionary GP process.
@@ -1079,7 +1082,7 @@ def run_evolution(data_dir: str,
     toolbox = base.Toolbox()
 
     # Register tree generation methods
-    toolbox.register("expr", gp.genHalfAndHalf, pset=pset, min_=1, max_=6)
+    toolbox.register("expr", gp.genHalfAndHalf, pset=pset, min_=0, max_=4)
     toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.expr)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
     toolbox.register("compile", gp.compile, pset=pset)
