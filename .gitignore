@@ -1,6 +1,9 @@
-# Byte-compiled / optimized / DLL files
 __pycache__/
 Algorithm_Output/
 Regression_Results/
 Data-GP/Exp1
 Data-GP/Exp2
+UCI-DATA_RAW
+Prelim/
+Experiments/Ablation
+Recommender_Output/
