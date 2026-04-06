@@ -1006,7 +1006,7 @@ def run_evolution(data_dir: str,
                   seed: int,
                   output_dir: str,
                   n_cpus: int,
-                  pop_size: int = 200,
+                  pop_size: int = 500,
                   n_generations: int = 50,
                   cxpb: float = 0.8,
                   mutpb: float = 0.2,
@@ -1022,12 +1022,12 @@ def run_evolution(data_dir: str,
         seed: Random seed for reproducibility.
         output_dir: Directory to save outputs.
         n_cpus: Number of CPUs for parallelization.
-        pop_size: Population size (default 200).
+        pop_size: Population size (default 500).
         n_generations: Number of generations (default 50).
         cxpb: Crossover probability (default 0.8).
         mutpb: Mutation probability (default 0.2).
-        max_height: Maximum tree height (default 20).
-        max_size: Maximum tree size (default 200).
+        max_height: Maximum tree height (default 17).
+        max_size: Maximum tree size (default 100).
     """
     global _module_rng  # Module-level rng for ERC generation
 
